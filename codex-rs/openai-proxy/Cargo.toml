@@ -21,3 +21,4 @@ tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
 toml = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
+tower-http = { version = "0.6", features = ["trace", "cors"] }
