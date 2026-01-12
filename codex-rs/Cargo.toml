@@ -47,6 +47,7 @@ members = [
     "utils/string",
     "codex-client",
     "codex-api",
+    "openai-proxy",
 ]
 resolver = "2"
 
