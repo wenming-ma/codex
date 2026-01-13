@@ -26,6 +26,7 @@ use codex_core::protocol::Op;
 use codex_core::protocol::SandboxPolicy;
 use codex_core::protocol::Submission;
 use codex_protocol::config_types::ReasoningSummary;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::SessionSource;
@@ -69,6 +70,10 @@ struct ChatCompletionRequest {
     #[serde(default)]
     messages: Option<Vec<ChatMessage>>,
     #[serde(default)]
+    input: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    instructions: Option<String>,
+    #[serde(default)]
     stream: bool,
     #[serde(default)]
     conversation_id: Option<String>,
@@ -89,6 +94,49 @@ struct Usage {
     prompt_tokens: u32,
     completion_tokens: u32,
     total_tokens: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesRequest {
+    model: String,
+    input: Vec<ResponseItem>,
+    #[serde(default)]
+    instructions: Option<String>,
+    #[serde(default)]
+    stream: bool,
+    #[serde(default)]
+    conversation_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ResponsesResponse {
+    id: String,
+    object: String,
+    created_at: u64,
+    model: String,
+    status: String,
+    output: Vec<ResponseItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    conversation_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ResponseEventPayload {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response: Option<ResponseSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    item: Option<ResponseItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delta: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ResponseSummary {
+    id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    conversation_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -150,19 +198,24 @@ async fn main() -> anyhow::Result<()> {
         .allow_methods(Any)
         .allow_headers(Any);
 
+    // Static files service - use path relative to workspace
     let static_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("static");
+
     info!("Static files directory: {:?}", static_dir);
 
     let router = Router::new()
-        // With /v1 prefix (OpenAI standard)
+        // With /v1 prefix
         .route("/v1/models", get(handle_models))
         .route("/v1/chat/completions", post(handle_chat_completions))
-        // Without /v1 prefix (Cursor compatibility)
+        .route("/v1/responses", post(handle_responses))
+        // Without /v1 prefix (for Cursor compatibility)
         .route("/models", get(handle_models))
         .route("/chat/completions", post(handle_chat_completions))
-        // Log viewer routes
+        .route("/responses", post(handle_responses))
+        // Log viewer
         .route("/logs", get(handle_logs_redirect))
         .route("/logs/stream", get(handle_logs_stream))
+        // Static files
         .route("/logs.html", get(|| async {
             axum::response::Redirect::permanent("/static/logs.html")
         }))
@@ -172,7 +225,6 @@ async fn main() -> anyhow::Result<()> {
         .route("/logs.js", get(|| async {
             axum::response::Redirect::permanent("/static/logs.js")
         }))
-        // Static files
         .nest_service("/static", ServeDir::new(&static_dir))
         .with_state(state)
         .layer(cors)
@@ -183,13 +235,13 @@ async fn main() -> anyhow::Result<()> {
         .parse()
         .context("parse CODEX_OPENAI_PROXY_ADDR")?;
 
-    info!("codex-openai-proxy (pure forwarding mode) listening on http://{addr}");
+    info!("codex-openai-proxy (Codex adapter) listening on http://{addr}");
     info!("Web logs available at http://{addr}/logs");
 
     // Send initial log message
     log_message(serde_json::json!({
         "type": "info",
-        "message": format!("Proxy started in PURE FORWARDING mode (no tool execution) on {}", addr)
+        "message": format!("Proxy started on {}", addr)
     }).to_string());
 
     axum::serve(
@@ -222,7 +274,18 @@ async fn handle_chat_completions(
     handle_once(state, body.0).await
 }
 
+async fn handle_responses(
+    State(state): State<AppState>,
+    body: axum::Json<ResponsesRequest>,
+) -> Response {
+    if body.stream {
+        return handle_responses_stream(state, body.0).await;
+    }
+    handle_responses_once(state, body.0).await
+}
+
 async fn handle_models() -> Response {
+    // Log model list request
     log_message(serde_json::json!({
         "type": "incoming_request",
         "endpoint": "/models"
@@ -244,8 +307,7 @@ async fn handle_models() -> Response {
 }
 
 async fn handle_once(state: AppState, body: ChatCompletionRequest) -> Response {
-    let original_model = body.model.clone();
-
+    // Log incoming request from Cursor
     log_message(serde_json::json!({
         "type": "cursor_request",
         "message": format!("Request: model={}, stream={}", body.model, body.stream)
@@ -262,15 +324,10 @@ async fn handle_once(state: AppState, body: ChatCompletionRequest) -> Response {
         }
     };
 
-    let model = map_model(&body.model);
+    // Store original model name for response
+    let original_model = body.model.clone();
 
-    log_message(serde_json::json!({
-        "type": "codex_forward",
-        "message": format!("Forward to Codex: original_model={}, mapped_model={}, conv_id={}",
-            body.model, model, body.conversation_id.as_deref().unwrap_or("new"))
-    }).to_string());
-
-    let (thread, _conv_id) = match get_or_create_thread(&state, &model, body.conversation_id)
+    let (thread, conv_id) = match get_or_create_thread(&state, &body.model, body.conversation_id)
         .await
     {
         Ok(t) => t,
@@ -280,8 +337,18 @@ async fn handle_once(state: AppState, body: ChatCompletionRequest) -> Response {
     let submission_id = uuid::Uuid::new_v4().to_string();
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let payload_text = merged_text.clone();
+    let model = map_model(&body.model);
+
+    // Log forward to Codex
+    log_message(serde_json::json!({
+        "type": "codex_forward",
+        "message": format!("Forward to Codex: original_model={}, mapped_model={}, conv_id={}",
+            body.model, model, conv_id)
+    }).to_string());
+
     let tool_calls = Arc::new(Mutex::new(Vec::<ToolCall>::new()));
     let tool_calls_for_task = tool_calls.clone();
+    let model_for_task = model.clone();
 
     let handle = tokio::spawn(async move {
         let submission = Submission {
@@ -292,10 +359,10 @@ async fn handle_once(state: AppState, body: ChatCompletionRequest) -> Response {
                 }],
                 cwd,
                 approval_policy: AskForApproval::Never,
-                sandbox_policy: SandboxPolicy::ReadOnly,  // ⚠️ ReadOnly: Codex won't execute tools
-                model: model.clone(),
+                sandbox_policy: SandboxPolicy::Unrestricted,  // Allow tools to execute properly
+                model: model_for_task.clone(),
                 effort: None,
-                summary: ReasoningSummary::Detailed,
+                summary: ReasoningSummary::Detailed,  // Enable detailed reasoning summary
                 final_output_json_schema: None,
             },
         };
@@ -321,16 +388,6 @@ async fn handle_once(state: AppState, body: ChatCompletionRequest) -> Response {
                 }
                 EventMsg::AgentMessageDelta(d) => final_text.push_str(&d.delta),
                 EventMsg::RawResponseItem(raw) => {
-                    // Log reasoning
-                    if let ResponseItem::Reasoning { id, summary, .. } = &raw.item {
-                        log_message(serde_json::json!({
-                            "type": "reasoning_detected",
-                            "id": id,
-                            "summary_count": summary.len(),
-                        }).to_string());
-                    }
-
-                    // Collect tool calls
                     if let Some(tc) = map_tool_call(&raw.item) {
                         tool_calls_for_task.lock().await.push(tc);
                     }
@@ -368,7 +425,6 @@ async fn handle_once(state: AppState, body: ChatCompletionRequest) -> Response {
             );
         }
     };
-
     let tool_calls_snapshot = {
         let guard = tool_calls.lock().await;
         guard.clone()
@@ -378,7 +434,7 @@ async fn handle_once(state: AppState, body: ChatCompletionRequest) -> Response {
         id: format!("chatcmpl-codex-{}", uuid::Uuid::new_v4()),
         object: "chat.completion".to_string(),
         created: now_ts(),
-        model: original_model.clone(),  // ⚠️ Use original model name
+        model: original_model.clone(),
         choices: vec![ChatChoice {
             index: 0,
             message: ChatMessageResponse {
@@ -414,12 +470,153 @@ async fn handle_once(state: AppState, body: ChatCompletionRequest) -> Response {
     json_response(StatusCode::OK, body)
 }
 
+async fn handle_responses_once(state: AppState, body: ResponsesRequest) -> Response {
+    let merged_text = match merge_responses_input(&body.input, body.instructions.as_deref()) {
+        Some(text) => text,
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "no user content found".to_string(),
+                "invalid_request_error",
+            );
+        }
+    };
+
+    let (thread, conv_id) = match get_or_create_thread(&state, &body.model, body.conversation_id)
+        .await
+    {
+        Ok(t) => t,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e, "internal_error"),
+    };
+
+    let submission_id = uuid::Uuid::new_v4().to_string();
+    let response_id = format!("resp-codex-{}", uuid::Uuid::new_v4());
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let payload_text = merged_text.clone();
+    let model = map_model(&body.model);
+    let response_model = model.clone();
+    let output_items = Arc::new(Mutex::new(Vec::<ResponseItem>::new()));
+    let output_items_for_task = output_items.clone();
+
+    let handle = tokio::spawn(async move {
+        let submission = Submission {
+            id: submission_id.clone(),
+            op: Op::UserTurn {
+                items: vec![UserInput::Text {
+                    text: payload_text.clone(),
+                }],
+                cwd,
+                approval_policy: AskForApproval::Never,
+                sandbox_policy: SandboxPolicy::Unrestricted,  // Allow tools to execute properly
+                model: model.clone(),
+                effort: None,
+                summary: ReasoningSummary::Detailed,  // Enable detailed reasoning summary
+                final_output_json_schema: None,
+            },
+        };
+
+        thread
+            .submit_with_id(submission)
+            .await
+            .map_err(|e| format!("submit error: {e}"))?;
+
+        let mut final_text = String::new();
+        let mut text_seen = false;
+        loop {
+            let ev = thread
+                .next_event()
+                .await
+                .map_err(|e| format!("event error: {e}"))?;
+            if ev.id != submission_id {
+                continue;
+            }
+            match ev.msg {
+                EventMsg::AgentMessage(m) => {
+                    final_text.push_str(&m.message);
+                    final_text.push('\n');
+                    text_seen = true;
+                }
+                EventMsg::AgentMessageDelta(d) => {
+                    final_text.push_str(&d.delta);
+                    text_seen = true;
+                }
+                EventMsg::RawResponseItem(raw) => {
+                    output_items_for_task.lock().await.push(raw.item);
+                }
+                EventMsg::TurnComplete(done) => {
+                    if let Some(msg) = done.last_agent_message {
+                        final_text = msg;
+                        text_seen = true;
+                    }
+                    break;
+                }
+                EventMsg::Error(err) => return Err(format!("Codex error: {}", err.message)),
+                EventMsg::Warning(warn) => {
+                    info!("warning from Codex: {}", warn.message);
+                }
+                EventMsg::TurnAborted(abort) => {
+                    return Err(format!("Turn aborted: {:?}", abort.reason));
+                }
+                _ => {}
+            }
+        }
+
+        if text_seen && !final_text.trim().is_empty() {
+            output_items_for_task
+                .lock()
+                .await
+                .push(ResponseItem::Message {
+                    id: None,
+                    role: "assistant".to_string(),
+                    content: vec![ContentItem::OutputText {
+                        text: final_text.trim().to_string(),
+                    }],
+                });
+        }
+
+        Ok(())
+    });
+
+    match handle.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, e, "internal_error");
+        }
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                e.to_string(),
+                "internal_error",
+            );
+        }
+    }
+
+    let output_items_snapshot = {
+        let guard = output_items.lock().await;
+        guard.clone()
+    };
+
+    let resp = ResponsesResponse {
+        id: response_id,
+        object: "response".to_string(),
+        created_at: now_ts(),
+        model: response_model,
+        status: "completed".to_string(),
+        output: output_items_snapshot,
+        conversation_id: Some(conv_id.to_string()),
+    };
+
+    let body = serde_json::to_string(&resp).unwrap_or_else(|_| "{}".to_string());
+    json_response(StatusCode::OK, body)
+}
+
 async fn handle_stream(state: AppState, body: ChatCompletionRequest) -> Response {
     log_message(serde_json::json!({
         "type": "stream_start",
         "model": body.model,
     }).to_string());
 
+    // Store original model name for response
     let original_model = body.model.clone();
 
     let merged_text = match merged_text_from_request(&body) {
@@ -475,10 +672,10 @@ async fn handle_stream(state: AppState, body: ChatCompletionRequest) -> Response
                 }],
                 cwd,
                 approval_policy: AskForApproval::Never,
-                sandbox_policy: SandboxPolicy::ReadOnly,  // ⚠️ ReadOnly: Codex won't execute tools
+                sandbox_policy: SandboxPolicy::Unrestricted,  // Allow tools to execute properly
                 model: model.clone(),
                 effort: None,
-                summary: ReasoningSummary::Detailed,
+                summary: ReasoningSummary::Detailed,  // Enable detailed reasoning summary
                 final_output_json_schema: None,
             },
         };
@@ -524,33 +721,39 @@ async fn handle_stream(state: AppState, body: ChatCompletionRequest) -> Response
                     let _ = tx.send(Ok(chunk)).await;
                 }
                 EventMsg::RawResponseItem(raw) => {
-                    // Log reasoning items
-                    if let ResponseItem::Reasoning { id, summary, .. } = &raw.item {
+                    // Log all ResponseItems to check for Reasoning
+                    log_message(serde_json::json!({
+                        "type": "raw_response_item",
+                        "item_type": format!("{:?}", raw.item).chars().take(100).collect::<String>()
+                    }).to_string());
+
+                    // Check if it's a Reasoning item
+                    if let ResponseItem::Reasoning { id, summary, content, .. } = &raw.item {
                         log_message(serde_json::json!({
-                            "type": "reasoning_item",
+                            "type": "reasoning_detected",
                             "id": id,
                             "summary_count": summary.len(),
+                            "has_content": content.is_some(),
+                            "summary_preview": summary.first().map(|s| match s {
+                                codex_protocol::models::ReasoningItemReasoningSummary::SummaryText { text } =>
+                                    text.chars().take(100).collect::<String>()
+                            })
                         }).to_string());
                     }
 
-                    // Send tool calls to Cursor
                     if let Some(tc) = map_tool_call(&raw.item) {
                         tool_seen_for_task.store(true, Ordering::Relaxed);
-                        log_message(serde_json::json!({
-                            "type": "tool_call_forwarded",
-                            "name": tc.function.name.clone()
-                        }).to_string());
                         let chunk =
                             stream_chunk(None, Some(tc), false, &model_for_response);
                         let _ = tx.send(Ok(chunk)).await;
                     }
                 }
-                EventMsg::TurnComplete(_done) => {
+                EventMsg::TurnComplete(done) => {
                     log_message(serde_json::json!({
                         "type": "stream_complete"
                     }).to_string());
 
-                    // ⚠️ Don't send last_agent_message here - we already sent it via AgentMessageDelta
+                    // Don't send last_agent_message here - we already sent it via AgentMessageDelta
                     // Sending it again causes "looping detected" error in Cursor
 
                     let finish_reason = if tool_seen_for_task.load(Ordering::Relaxed) {
@@ -606,6 +809,10 @@ async fn handle_stream(state: AppState, body: ChatCompletionRequest) -> Response
             }
             other => {
                 let data = serde_json::to_string(&other).unwrap_or_else(|_| "{}".to_string());
+                log_message(serde_json::json!({
+                    "type": "stream_send_chunk",
+                    "data": data.clone()
+                }).to_string());
                 Ok::<Event, std::convert::Infallible>(Event::default().data(data))
             }
         },
@@ -628,50 +835,142 @@ async fn handle_stream(state: AppState, body: ChatCompletionRequest) -> Response
         .into_response()
 }
 
-async fn get_or_create_thread(
-    state: &AppState,
-    model: &str,
-    conversation_id: Option<String>,
-) -> Result<(Arc<CodexThread>, String), String> {
-    let overrides = vec![
-        ("model".to_string(), toml::Value::String(map_model(model))),
-        (
-            "approval_policy".to_string(),
-            toml::Value::String("never".to_string()),
-        ),
-        (
-            "sandbox_mode".to_string(),
-            toml::Value::String("read-only".to_string()),  // ⚠️ ReadOnly: no tool execution
-        ),
-    ];
+async fn handle_responses_stream(state: AppState, body: ResponsesRequest) -> Response {
+    let merged_text = match merge_responses_input(&body.input, body.instructions.as_deref()) {
+        Some(text) => text,
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "no user content found".to_string(),
+                "invalid_request_error",
+            );
+        }
+    };
 
-    let config = Config::load_with_cli_overrides(overrides)
+    let (thread, conv_id) = match get_or_create_thread(&state, &body.model, body.conversation_id)
         .await
-        .map_err(|e| e.to_string())?;
+    {
+        Ok(t) => t,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e, "internal_error"),
+    };
 
-    if let Some(cid) = conversation_id {
-        let tid = codex_protocol::ThreadId::from_string(&cid)
-            .map_err(|e| format!("invalid conversation_id: {e}"))?;
-        let thread = state
-            .thread_manager
-            .get_thread(tid)
-            .await
-            .map_err(|e| format!("thread not found: {e}"))?;
-        return Ok((thread, cid));
-    }
+    let submission_id = uuid::Uuid::new_v4().to_string();
+    let response_id = format!("resp-codex-{}", uuid::Uuid::new_v4());
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let payload_text = merged_text.clone();
+    let model = map_model(&body.model);
+    let conv_id_clone = conv_id.clone();
+    let text_seen = Arc::new(AtomicBool::new(false));
+    let text_seen_for_task = text_seen.clone();
 
-    let new_thread = state
-        .thread_manager
-        .start_thread(config)
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok((new_thread.thread, new_thread.thread_id.to_string()))
+    let (tx, rx) = mpsc::channel(16);
+
+    let created_event = response_created_event(&response_id, Some(conv_id_clone.clone()));
+    let _ = tx.send(Ok(created_event)).await;
+
+    tokio::spawn(async move {
+        let submission = Submission {
+            id: submission_id.clone(),
+            op: Op::UserTurn {
+                items: vec![UserInput::Text {
+                    text: payload_text.clone(),
+                }],
+                cwd,
+                approval_policy: AskForApproval::Never,
+                sandbox_policy: SandboxPolicy::Unrestricted,  // Allow tools to execute properly
+                model: model.clone(),
+                effort: None,
+                summary: ReasoningSummary::Detailed,  // Enable detailed reasoning summary
+                final_output_json_schema: None,
+            },
+        };
+
+        if let Err(e) = thread.submit_with_id(submission).await {
+            let _ = tx.send(Err(format!("submit error: {e}"))).await;
+            return;
+        }
+
+        loop {
+            let ev = match thread.next_event().await {
+                Ok(ev) => ev,
+                Err(e) => {
+                    let _ = tx.send(Err(format!("event error: {e}"))).await;
+                    return;
+                }
+            };
+            if ev.id != submission_id {
+                continue;
+            }
+            match ev.msg {
+                EventMsg::AgentMessage(m) => {
+                    text_seen_for_task.store(true, Ordering::Relaxed);
+                    let chunk = response_output_text_delta_event(&m.message);
+                    let _ = tx.send(Ok(chunk)).await;
+                }
+                EventMsg::AgentMessageDelta(d) => {
+                    text_seen_for_task.store(true, Ordering::Relaxed);
+                    let chunk = response_output_text_delta_event(&d.delta);
+                    let _ = tx.send(Ok(chunk)).await;
+                }
+                EventMsg::RawResponseItem(raw) => {
+                    let chunk = response_output_item_done_event(raw.item);
+                    let _ = tx.send(Ok(chunk)).await;
+                }
+                EventMsg::TurnComplete(done) => {
+                    if let Some(msg) = done.last_agent_message
+                        && !text_seen_for_task.load(Ordering::Relaxed)
+                    {
+                        text_seen_for_task.store(true, Ordering::Relaxed);
+                        let chunk = response_output_text_delta_event(&msg);
+                        let _ = tx.send(Ok(chunk)).await;
+                    }
+                    let chunk = response_completed_event(&response_id, Some(conv_id_clone.clone()));
+                    let _ = tx.send(Ok(chunk)).await;
+                    let _ = tx
+                        .send(Ok(serde_json::Value::String("[DONE]".to_string())))
+                        .await;
+                    break;
+                }
+                EventMsg::Error(err) => {
+                    let _ = tx.send(Err(format!("Codex error: {}", err.message))).await;
+                    break;
+                }
+                EventMsg::Warning(warn) => {
+                    info!("warning from Codex: {}", warn.message);
+                }
+                EventMsg::TurnAborted(abort) => {
+                    let _ = tx
+                        .send(Err(format!("Turn aborted: {:?}", abort.reason)))
+                        .await;
+                    break;
+                }
+                _ => {}
+            }
+        }
+    });
+
+    let stream = ReceiverStream::new(rx).map(|msg| match msg {
+        Ok(json_val) => {
+            let data = serde_json::to_string(&json_val).unwrap_or_else(|_| "{}".to_string());
+            Ok::<Event, std::convert::Infallible>(Event::default().data(data))
+        }
+        Err(err) => Ok(Event::default().data(
+            serde_json::to_string(&serde_json::json!({
+                "error": err,
+            }))
+            .unwrap_or_else(|_| "{}".to_string()),
+        )),
+    });
+
+    Sse::new(stream)
+        .keep_alive(axum::response::sse::KeepAlive::default())
+        .into_response()
 }
 
 fn stream_chunk(
     content: Option<&str>,
     tool_call: Option<ToolCall>,
-    _done: bool,
+    done: bool,
     model: &str,
 ) -> serde_json::Value {
     let mut delta = serde_json::Map::new();
@@ -696,17 +995,116 @@ fn stream_chunk(
         );
     }
 
+    let finish_json = if done {
+        serde_json::Value::String(if delta.contains_key("tool_calls") {
+            "tool_calls".to_string()
+        } else {
+            "stop".to_string()
+        })
+    } else {
+        serde_json::Value::Null
+    };
+
     serde_json::json!({
         "id": format!("chatcmpl-codex-{}", uuid::Uuid::new_v4()),
         "object": "chat.completion.chunk",
         "created": now_ts(),
-        "model": model,  // ⚠️ Always include model field
+        "model": model,
         "choices": [{
             "index": 0,
             "delta": delta,
-            "finish_reason": null,
+            "finish_reason": finish_json,
         }],
     })
+}
+
+fn response_created_event(response_id: &str, conversation_id: Option<String>) -> serde_json::Value {
+    serde_json::to_value(ResponseEventPayload {
+        kind: "response.created".to_string(),
+        response: Some(ResponseSummary {
+            id: response_id.to_string(),
+            conversation_id,
+        }),
+        item: None,
+        delta: None,
+    })
+    .unwrap_or_else(|_| serde_json::json!({}))
+}
+
+fn response_output_text_delta_event(delta: &str) -> serde_json::Value {
+    serde_json::to_value(ResponseEventPayload {
+        kind: "response.output_text.delta".to_string(),
+        response: None,
+        item: None,
+        delta: Some(delta.to_string()),
+    })
+    .unwrap_or_else(|_| serde_json::json!({}))
+}
+
+fn response_output_item_done_event(item: ResponseItem) -> serde_json::Value {
+    serde_json::to_value(ResponseEventPayload {
+        kind: "response.output_item.done".to_string(),
+        response: None,
+        item: Some(item),
+        delta: None,
+    })
+    .unwrap_or_else(|_| serde_json::json!({}))
+}
+
+fn response_completed_event(
+    response_id: &str,
+    conversation_id: Option<String>,
+) -> serde_json::Value {
+    serde_json::to_value(ResponseEventPayload {
+        kind: "response.completed".to_string(),
+        response: Some(ResponseSummary {
+            id: response_id.to_string(),
+            conversation_id,
+        }),
+        item: None,
+        delta: None,
+    })
+    .unwrap_or_else(|_| serde_json::json!({}))
+}
+
+async fn get_or_create_thread(
+    state: &AppState,
+    model: &str,
+    conversation_id: Option<String>,
+) -> Result<(Arc<CodexThread>, String), String> {
+    let overrides = vec![
+        ("model".to_string(), toml::Value::String(map_model(model))),
+        (
+            "approval_policy".to_string(),
+            toml::Value::String("never".to_string()),
+        ),
+        (
+            "sandbox_mode".to_string(),
+            toml::Value::String("read-only".to_string()),
+        ),
+    ];
+
+    let config = Config::load_with_cli_overrides(overrides)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if let Some(cid) = conversation_id {
+        let tid = codex_protocol::ThreadId::from_string(&cid)
+            .map_err(|e| format!("invalid conversation_id: {e}"))?;
+        let thread = state
+            .thread_manager
+            .get_thread(tid)
+            .await
+            .map_err(|e| format!("thread not found: {e}"))?;
+        return Ok((thread, cid));
+    }
+
+    let new_thread = state
+        .thread_manager
+        .start_thread(config)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok((new_thread.thread, new_thread.thread_id.to_string()))
 }
 
 fn stream_chunk_with_finish(
@@ -741,7 +1139,7 @@ fn stream_chunk_with_finish(
         "id": format!("chatcmpl-codex-{}", uuid::Uuid::new_v4()),
         "object": "chat.completion.chunk",
         "created": now_ts(),
-        "model": model,  // ⚠️ Always include model field
+        "model": model,
         "choices": [{
             "index": 0,
             "delta": delta,
@@ -813,10 +1211,97 @@ fn merge_messages(msgs: &[ChatMessage]) -> Option<String> {
     }
 }
 
-fn merged_text_from_request(body: &ChatCompletionRequest) -> Option<String> {
-    if let Some(msgs) = &body.messages {
-        return merge_messages(msgs);
+fn merge_responses_input_values(
+    input: &[serde_json::Value],
+    instructions: Option<&str>,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(instr) = instructions
+        && !instr.trim().is_empty()
+    {
+        parts.push(format!("system: {}", instr.trim()));
     }
+
+    for item in input {
+        let Some(obj) = item.as_object() else {
+            continue;
+        };
+
+        let role = obj.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+
+        let content_val = obj
+            .get("content")
+            .or_else(|| obj.get("text"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+
+        let content_text = match content_val {
+            serde_json::Value::String(s) => s,
+            serde_json::Value::Array(arr) => arr
+                .iter()
+                .filter_map(|v| v.get("text").or_else(|| v.get("content")))
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
+        };
+
+        if !content_text.trim().is_empty() {
+            parts.push(format!("{role}: {}", content_text.trim()));
+        }
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n"))
+    }
+}
+
+fn merge_responses_input(input: &[ResponseItem], instructions: Option<&str>) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(instr) = instructions
+        && !instr.trim().is_empty()
+    {
+        parts.push(format!("system: {}", instr.trim()));
+    }
+
+    for item in input {
+        if let ResponseItem::Message { role, content, .. } = item {
+            let text = content
+                .iter()
+                .filter_map(|c| match c {
+                    ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                        Some(text.as_str())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !text.trim().is_empty() {
+                parts.push(format!("{role}: {}", text.trim()));
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n"))
+    }
+}
+
+fn merged_text_from_request(body: &ChatCompletionRequest) -> Option<String> {
+    if let Some(msgs) = &body.messages
+        && let Some(text) = merge_messages(msgs)
+    {
+        return Some(text);
+    }
+
+    if let Some(items) = &body.input {
+        return merge_responses_input_values(items, body.instructions.as_deref());
+    }
+
     None
 }
 

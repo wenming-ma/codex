@@ -11,14 +11,16 @@ bytes = { workspace = true }
 codex-core = { workspace = true }
 codex-app-server-protocol = { workspace = true }
 codex-protocol = { workspace = true }
+futures = "0.3"
 http = { workspace = true }
+once_cell = "1.19"
 reqwest = { workspace = true, features = ["stream"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-tokio-stream = { workspace = true }
+tokio-stream = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
 toml = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
-tower-http = { version = "0.6", features = ["trace", "cors"] }
+tower-http = { version = "0.6", features = ["trace", "cors", "fs"] }

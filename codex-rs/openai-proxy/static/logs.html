@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Codex OpenAI Proxy - Real-time Logs</title>
+    <link rel="stylesheet" href="/logs.css">
+</head>
+<body>
+    <div class="header">
+        <h1>🔄 Codex OpenAI Proxy - Real-time Logs</h1>
+        <div class="stats">
+            <span class="stat-item">
+                <span class="stat-label">Total:</span>
+                <span id="total-count" class="stat-value">0</span>
+            </span>
+            <span class="stat-item">
+                <span class="stat-label">Cursor:</span>
+                <span id="cursor-count" class="stat-value">0</span>
+            </span>
+            <span class="stat-item">
+                <span class="stat-label">Codex:</span>
+                <span id="codex-count" class="stat-value">0</span>
+            </span>
+            <span class="stat-item">
+                <span class="stat-label">Status:</span>
+                <span id="connection-status" class="stat-value status-connected">Connected</span>
+            </span>
+        </div>
+    </div>
+
+    <div class="controls">
+        <button id="clear-btn" class="btn">Clear Logs</button>
+        <button id="pause-btn" class="btn">Pause</button>
+        <label class="checkbox-label">
+            <input type="checkbox" id="auto-scroll" checked>
+            Auto Scroll
+        </label>
+    </div>
+
+    <div id="logs" class="logs-container"></div>
+
+    <script src="/logs.js"></script>
+</body>
+</html>
